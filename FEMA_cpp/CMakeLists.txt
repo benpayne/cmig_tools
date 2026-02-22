@@ -63,6 +63,10 @@ endif()
 add_executable(fema_example example_main.cpp)
 target_link_libraries(fema_example PRIVATE fema)
 
+# ── Benchmark binary ─────────────────────────────────────────────────────────
+add_executable(fema_benchmark benchmark.cpp)
+target_link_libraries(fema_benchmark PRIVATE fema)
+
 # ── Install rules ─────────────────────────────────────────────────────────────
 install(TARGETS fema ARCHIVE DESTINATION lib)
 install(FILES fema.h DESTINATION include)
