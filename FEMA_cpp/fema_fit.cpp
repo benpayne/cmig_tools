@@ -292,8 +292,10 @@ FitResult fit(
                 tvec_bins = Vec::Zero(nsig2bins);
                 binvec    = VecI::Constant(num_y, -1);
 
-                for (int bi = 0; bi < nsig2bins; ++bi) {
-                    for (int v = 0; v < num_y; ++v) {
+                // Assign each voxel to its bin (voxel-major for OpenMP)
+                #pragma omp parallel for schedule(static)
+                for (int v = 0; v < num_y; ++v) {
+                    for (int bi = 0; bi < nsig2bins; ++bi) {
                         bool in_bin = true;
                         for (int ri = 0; ri < num_RFX - 1; ++ri) {
                             if (sig2mat(ri, v) < sig2gridl(bi, ri) ||
@@ -304,12 +306,17 @@ FitResult fit(
                         }
                         if (in_bin) {
                             binvec(v) = bi;
-                            nvec_bins(bi) += 1;
+                            break;
                         }
                     }
                 }
+                // Compute bin counts (serial, O(num_y))
+                for (int v = 0; v < num_y; ++v) {
+                    if (binvec(v) >= 0) nvec_bins(binvec(v)) += 1;
+                }
 
                 // Coerce unassigned bins to nearest
+                #pragma omp parallel for schedule(static)
                 for (int v = 0; v < num_y; ++v) {
                     if (binvec(v) < 0) {
                         double min_diff = std::numeric_limits<double>::max();
@@ -366,30 +373,39 @@ FitResult fit(
                     coeffCovar[v] = Mat::Zero(num_X, num_X);
             }
 
-            // Collect unique bins
+            // Precompute bin-to-voxel mappings for parallel bin loop
             std::vector<int> unique_bins;
+            std::vector<std::vector<int>> bin_voxels;
             {
                 std::unordered_set<int> seen;
+                int max_bin = -1;
                 for (int v = 0; v < num_y; ++v) {
-                    if (binvec(v) >= 0 && seen.insert(binvec(v)).second)
-                        unique_bins.push_back(binvec(v));
+                    int b = binvec(v);
+                    if (b >= 0) {
+                        if (seen.insert(b).second) unique_bins.push_back(b);
+                        if (b > max_bin) max_bin = b;
+                    }
+                }
+                bin_voxels.resize(max_bin + 1);
+                for (int v = 0; v < num_y; ++v) {
+                    if (binvec(v) >= 0) bin_voxels[binvec(v)].push_back(v);
                 }
             }
 
-            for (int bi : unique_bins) {
-                auto t_bin = Clock::now();
-
-                // Indices in this bin
-                std::vector<int> ivec_bin;
-                for (int v = 0; v < num_y; ++v)
-                    if (binvec(v) == bi) ivec_bin.push_back(v);
-
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t ub = 0; ub < unique_bins.size(); ++ub) {
+                int bi = unique_bins[ub];
+                const auto& ivec_bin = bin_voxels[bi];
                 if (ivec_bin.empty()) continue;
+
+                auto t_bin = Clock::now();
 
                 // Average sig2vec for this bin
                 Vec sig2vec = Vec::Zero(num_RFX);
                 for (int v : ivec_bin) sig2vec += sig2mat.col(v);
                 sig2vec /= ivec_bin.size();
+
+                Mat Cov_beta_bin;  // thread-local
 
                 if (OLSflag) {
                     // OLS path
@@ -402,7 +418,7 @@ FitResult fit(
                         beta_hat.col(v) = iXtX2 * (X.transpose() * ymat_work.col(v));
                         beta_se.col(v)  = (iXtX2.diagonal() * sig2tvec(v)).cwiseSqrt();
                     }
-                    Cov_beta = iXtX2;
+                    Cov_beta_bin = iXtX2;
                 } else {
                     // GLS path: compute W = V^{-1} per family/famtype
                     // XtW = X' * W, B = XtW * X, Bi = B^{-1}
@@ -466,7 +482,7 @@ FitResult fit(
                         Bi = B.ldlt().solve(Mat::Identity(num_X, num_X));
                     }
 
-                    Cov_beta = nearest_spd(Bi);
+                    Cov_beta_bin = nearest_spd(Bi);
 
                     // Compute beta for all voxels in this bin at once
                     // beta_hat(:, ivec_bin) = Bi * XtW * ymat(:, ivec_bin)
@@ -474,22 +490,22 @@ FitResult fit(
                     for (size_t j = 0; j < ivec_bin.size(); ++j)
                         y_bin.col(j) = ymat_work.col(ivec_bin[j]);
 
-                    Mat bhat = Cov_beta * (XtW * y_bin);
+                    Mat bhat = Cov_beta_bin * (XtW * y_bin);
                     for (size_t j = 0; j < ivec_bin.size(); ++j) {
                         beta_hat.col(ivec_bin[j]) = bhat.col(j);
-                        beta_se.col(ivec_bin[j])  = (Cov_beta.diagonal() * sig2tvec(ivec_bin[j])).cwiseSqrt();
+                        beta_se.col(ivec_bin[j])  = (Cov_beta_bin.diagonal() * sig2tvec(ivec_bin[j])).cwiseSqrt();
                     }
                 }
 
                 // Save coefficient covariance
                 if (permi == 0) {
                     for (int v : ivec_bin)
-                        coeffCovar[v] = Cov_beta * sig2tvec(v);
+                        coeffCovar[v] = Cov_beta_bin * sig2tvec(v);
                 }
 
                 // Evaluate contrasts
                 for (int ci2 = 0; ci2 < num_C; ++ci2) {
-                    double cvc = (C.row(ci2) * Cov_beta * C.row(ci2).transpose())(0, 0);
+                    double cvc = (C.row(ci2) * Cov_beta_bin * C.row(ci2).transpose())(0, 0);
                     for (int v : ivec_bin) {
                         betacon_hat(ci2, v) = (C.row(ci2) * beta_hat.col(v))(0);
                         betacon_se(ci2, v)  = std::sqrt(cvc * sig2tvec(v));
